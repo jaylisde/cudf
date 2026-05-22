@@ -22,7 +22,7 @@ namespace cg = cooperative_groups;
 namespace {
 
 constexpr int decode_block_size = 128;
-constexpr int rolling_buf_size  = decode_block_size * 2;
+constexpr int rolling_buf_size  = decode_block_size * 4;
 
 /**
  * @brief Kernel for computing the BYTE_STREAM_SPLIT column data stored in the pages
