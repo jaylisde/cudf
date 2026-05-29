@@ -91,98 +91,30 @@ __device__ void initialize_shmem_aggregations(cooperative_groups::thread_block c
   }
 }
 
-__device__ void compute_pre_aggregations(cudf::size_type col_start,
-                                         cudf::size_type col_end,
-                                         bitmask_type const* row_bitmask,
-                                         cudf::table_device_view source,
-                                         cudf::size_type num_input_rows,
-                                         cudf::size_type* local_mapping_index,
-                                         cuda::std::byte* shmem_agg_storage,
-                                         cudf::size_type* shmem_agg_res_offsets,
-                                         cudf::size_type* shmem_agg_mask_offsets,
-                                         cudf::aggregation::Kind const* d_agg_kinds,
-                                         cudf::size_type agg_location_offset)
-{
-  // Aggregates global memory sources to shared memory targets
-  for (auto source_idx = cudf::detail::grid_1d::global_thread_id(); source_idx < num_input_rows;
-       source_idx += cudf::detail::grid_1d::grid_stride()) {
-    if (not row_bitmask or cudf::bit_is_set(row_bitmask, source_idx)) {
-      auto const target_idx = local_mapping_index[source_idx] + agg_location_offset;
-      for (auto col_idx = col_start; col_idx < col_end; col_idx++) {
-        auto const source_col = source.column(col_idx);
 
-        cuda::std::byte* target =
-          reinterpret_cast<cuda::std::byte*>(shmem_agg_storage + shmem_agg_res_offsets[col_idx]);
-        bool* target_mask =
-          reinterpret_cast<bool*>(shmem_agg_storage + shmem_agg_mask_offsets[col_idx]);
-
-        cudf::detail::dispatch_type_and_aggregation(source_col.type(),
-                                                    d_agg_kinds[col_idx],
-                                                    shmem_element_aggregator{},
-                                                    target,
-                                                    target_mask,
-                                                    target_idx,
-                                                    source_col,
-                                                    source_idx);
-      }
-    }
-  }
-}
-
-__device__ void compute_final_aggregations(cooperative_groups::thread_block const& block,
-                                           cudf::size_type col_start,
-                                           cudf::size_type col_end,
-                                           cudf::table_device_view input_values,
-                                           cudf::mutable_table_device_view target,
-                                           cudf::size_type cardinality,
-                                           cudf::size_type num_agg_locations,
-                                           cudf::size_type* global_mapping_index,
-                                           cuda::std::byte* shmem_agg_storage,
-                                           cudf::size_type* agg_res_offsets,
-                                           cudf::size_type* agg_mask_offsets,
-                                           cudf::aggregation::Kind const* d_agg_kinds)
-{
-  // Aggregates shared memory sources to global memory targets
-  for (auto idx = block.thread_rank(); idx < num_agg_locations; idx += block.num_threads()) {
-    auto const target_idx =
-      global_mapping_index[(block.group_index().x * GROUPBY_CARDINALITY_THRESHOLD) +
-                           (idx % cardinality)];
-    for (auto col_idx = col_start; col_idx < col_end; col_idx++) {
-      auto target_col = target.column(col_idx);
-
-      cuda::std::byte* source =
-        reinterpret_cast<cuda::std::byte*>(shmem_agg_storage + agg_res_offsets[col_idx]);
-      bool* source_mask = reinterpret_cast<bool*>(shmem_agg_storage + agg_mask_offsets[col_idx]);
-
-      cudf::detail::dispatch_type_and_aggregation(input_values.column(col_idx).type(),
-                                                  d_agg_kinds[col_idx],
-                                                  gmem_element_aggregator{},
-                                                  target_col,
-                                                  target_idx,
-                                                  input_values.column(col_idx),
-                                                  source,
-                                                  source_mask,
-                                                  idx);
-    }
-  }
-}
-
-/* Takes the local_mapping_index and global_mapping_index to compute
- * pre (shared) and final (global) aggregates*/
+/* Takes local_mapping_index (block-local slot, written by the mapping kernel) and
+ * global_mapping_index (block-local slot -> compact output row, already transformed
+ * by the host). Computes pre (shared) and final (global) aggregates with an
+ * independently-sized grid by computing the mapping kernel's block id from each
+ * row's position in its grid-stride loop. The lookup table global_mapping_index is
+ * O(mapping_grid_size * 128) bytes (~80KB at grid=160), so it fits in L2 cache. */
 CUDF_KERNEL void single_pass_shmem_aggs_kernel(cudf::size_type num_rows,
                                                bitmask_type const* row_bitmask,
-                                               cudf::size_type* local_mapping_index,
-                                               cudf::size_type* global_mapping_index,
-                                               cudf::size_type* block_cardinality,
+                                               cudf::size_type const* local_mapping_index,
+                                               cudf::size_type const* global_mapping_index,
+                                               cudf::size_type mapping_grid_stride,
+                                               cudf::size_type num_groups,
                                                cudf::table_device_view input_values,
                                                cudf::mutable_table_device_view output_values,
                                                cudf::aggregation::Kind const* d_agg_kinds,
                                                cudf::size_type total_agg_size,
                                                cudf::size_type offsets_size)
 {
-  auto const block       = cooperative_groups::this_thread_block();
-  auto const cardinality = block_cardinality[block.group_index().x];
-  if (cardinality > GROUPBY_CARDINALITY_THRESHOLD or cardinality == 0) { return; }
+  auto const block = cooperative_groups::this_thread_block();
+
+  // num_groups is the dense compact range; it's also the per-block cardinality upper bound.
+  // Pre-checked by host: num_groups <= GROUPBY_CARDINALITY_THRESHOLD.
+  auto const cardinality = num_groups;
 
   auto constexpr min_shmem_agg_locations = 32;
   auto const multiplication_factor       = min_shmem_agg_locations / cardinality;
@@ -236,31 +168,58 @@ CUDF_KERNEL void single_pass_shmem_aggs_kernel(cudf::size_type num_rows,
                                   d_agg_kinds);
     __syncthreads();
 
-    compute_pre_aggregations(col_start,
-                             col_end,
-                             row_bitmask,
-                             input_values,
-                             num_rows,
-                             local_mapping_index,
-                             shmem_agg_storage,
-                             shmem_agg_res_offsets,
-                             shmem_agg_mask_offsets,
-                             d_agg_kinds,
-                             agg_location_offset);
+    // Pre-aggregation: derive the mapping kernel's block id from this row's position
+    // in the mapping kernel's grid stride, then look up local_slot -> compact_id via
+    // global_mapping_index (in L2). This decouples shmem_aggs's grid size from the
+    // mapping kernel's grid size at the cost of one extra L2-cached load per row.
+    for (auto source_idx = cudf::detail::grid_1d::global_thread_id(); source_idx < num_rows;
+         source_idx += cudf::detail::grid_1d::grid_stride()) {
+      if (not row_bitmask or cudf::bit_is_set(row_bitmask, source_idx)) {
+        auto const mapping_block_id =
+          (source_idx % mapping_grid_stride) / GROUPBY_BLOCK_SIZE;
+        auto const local_slot = local_mapping_index[source_idx];
+        auto const compact_id =
+          global_mapping_index[mapping_block_id * GROUPBY_CARDINALITY_THRESHOLD + local_slot];
+        auto const target_idx = compact_id + agg_location_offset;
+        for (auto col_idx = col_start; col_idx < col_end; col_idx++) {
+          auto const source_col = input_values.column(col_idx);
+          cuda::std::byte* target =
+            reinterpret_cast<cuda::std::byte*>(shmem_agg_storage + shmem_agg_res_offsets[col_idx]);
+          bool* target_mask =
+            reinterpret_cast<bool*>(shmem_agg_storage + shmem_agg_mask_offsets[col_idx]);
+          cudf::detail::dispatch_type_and_aggregation(source_col.type(),
+                                                      d_agg_kinds[col_idx],
+                                                      shmem_element_aggregator{},
+                                                      target,
+                                                      target_mask,
+                                                      target_idx,
+                                                      source_col,
+                                                      source_idx);
+        }
+      }
+    }
     __syncthreads();
 
-    compute_final_aggregations(block,
-                               col_start,
-                               col_end,
-                               input_values,
-                               output_values,
-                               cardinality,
-                               num_agg_locations,
-                               global_mapping_index,
-                               shmem_agg_storage,
-                               shmem_agg_res_offsets,
-                               shmem_agg_mask_offsets,
-                               d_agg_kinds);
+    // Final aggregation: flush shmem → global, output row = compact_id (= idx % cardinality)
+    for (auto idx = block.thread_rank(); idx < num_agg_locations; idx += block.num_threads()) {
+      auto const target_idx = idx % cardinality;
+      for (auto col_idx = col_start; col_idx < col_end; col_idx++) {
+        auto target_col = output_values.column(col_idx);
+        cuda::std::byte* source =
+          reinterpret_cast<cuda::std::byte*>(shmem_agg_storage + shmem_agg_res_offsets[col_idx]);
+        bool* source_mask =
+          reinterpret_cast<bool*>(shmem_agg_storage + shmem_agg_mask_offsets[col_idx]);
+        cudf::detail::dispatch_type_and_aggregation(input_values.column(col_idx).type(),
+                                                    d_agg_kinds[col_idx],
+                                                    gmem_element_aggregator{},
+                                                    target_col,
+                                                    target_idx,
+                                                    input_values.column(col_idx),
+                                                    source,
+                                                    source_mask,
+                                                    idx);
+      }
+    }
   }
 }
 }  // namespace
@@ -289,9 +248,10 @@ void compute_shared_memory_aggs(cudf::size_type grid_size,
                                 size_type available_shmem_size,
                                 cudf::size_type num_input_rows,
                                 bitmask_type const* row_bitmask,
-                                cudf::size_type* local_mapping_index,
-                                cudf::size_type* global_mapping_index,
-                                cudf::size_type* block_cardinality,
+                                cudf::size_type const* local_mapping_index,
+                                cudf::size_type const* global_mapping_index,
+                                cudf::size_type mapping_grid_stride,
+                                cudf::size_type num_groups,
                                 cudf::table_device_view input_values,
                                 cudf::mutable_table_device_view output_values,
                                 cudf::aggregation::Kind const* d_agg_kinds,
@@ -309,7 +269,8 @@ void compute_shared_memory_aggs(cudf::size_type grid_size,
     row_bitmask,
     local_mapping_index,
     global_mapping_index,
-    block_cardinality,
+    mapping_grid_stride,
+    num_groups,
     input_values,
     output_values,
     d_agg_kinds,

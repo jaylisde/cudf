@@ -17,6 +17,7 @@
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/table/table_device_view.cuh>
+#include <cudf/utilities/bit.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
@@ -56,24 +57,37 @@ std::pair<rmm::device_uvector<size_type>, bool> compute_single_pass_aggs(
     return std::pair{std::move(unique_key_indices), has_compound_aggs};
   };
 
-  // Grid size used for both index mapping and shared memory aggregation kernels.
+  // Grid size for the mapping kernel (no longer constrained by shmem_aggs kernel).
   auto const grid_size = [&] {
     auto const max_blocks_mapping =
       max_active_blocks_mapping_kernel<typename SetType::ref_type<cuco::insert_and_find_tag>>();
-    auto const max_blocks_aggs = max_active_blocks_shmem_aggs_kernel();
-    // We launch the same grid size for both kernels, thus we need to take the minimum of the two.
-    auto const max_blocks    = std::min(max_blocks_mapping, max_blocks_aggs);
-    auto const max_grid_size = max_blocks * cudf::detail::num_multiprocessors();
+    auto const max_grid_size = max_blocks_mapping * cudf::detail::num_multiprocessors();
     auto const num_blocks    = cudf::util::div_rounding_up_safe(num_rows, GROUPBY_BLOCK_SIZE);
     return std::min(max_grid_size, num_blocks);
   }();
 
-  // grid_size is zero means the shared memory kernel cannot be launched, since input cannot be
+  // grid_size is zero means the mapping kernel cannot be launched, since input cannot be
   // empty: empty input should already been handled before reaching here.
   if (grid_size <= 0) { return run_aggs_by_global_mem_kernel(); }
 
+  // Pre-compute shmem_aggs grid to determine available shared memory.
+  // Cap blocks/SM at 3 — going higher (e.g. 10) hurts because:
+  //   1. Each block does Phase 0 hash-table build + grid-stride scan; more blocks = more redundant work
+  //   2. Final flush uses global atomics on ~num_groups output rows; more blocks = more contention
+  // Empirically 3 blocks/SM matches the design doc's target and balances occupancy vs contention.
+  auto constexpr SHMEM_AGGS_BLOCKS_PER_SM_CAP = 3;
+  auto const shmem_max_grid_size              = [&] {
+    auto const max_blocks_aggs =
+      std::min(max_active_blocks_shmem_aggs_kernel(), SHMEM_AGGS_BLOCKS_PER_SM_CAP);
+    auto const max_grid_size = max_blocks_aggs * cudf::detail::num_multiprocessors();
+    auto const num_blocks    = cudf::util::div_rounding_up_safe(num_rows, GROUPBY_BLOCK_SIZE);
+    return std::min(max_grid_size, num_blocks);
+  }();
+
+  if (shmem_max_grid_size <= 0) { return run_aggs_by_global_mem_kernel(); }
+
   auto const [can_use_shared_mem_kernel, available_shmem_size] =
-    is_shared_memory_compatible(agg_kinds, values, grid_size);
+    is_shared_memory_compatible(agg_kinds, values, shmem_max_grid_size);
 
   if (!can_use_shared_mem_kernel) { return run_aggs_by_global_mem_kernel(); }
 
@@ -123,7 +137,18 @@ std::pair<rmm::device_uvector<size_type>, bool> compute_single_pass_aggs(
 
   auto unique_keys = extract_populated_keys(global_set, num_rows, stream, mr);
 
-  // Now, update the target indices for computing aggregations using the shared memory kernel.
+  // With decoupled grids, the shmem_aggs kernel discovers cardinality per-block independently.
+  // If global num_groups exceeds the threshold, some shmem_aggs block could see all groups
+  // and would have to skip them, causing correctness issues. Fall back to global memory.
+  if (static_cast<size_type>(unique_keys.size()) > GROUPBY_CARDINALITY_THRESHOLD) {
+    return run_aggs_by_global_mem_kernel();
+  }
+
+  // Transform global_mapping_indices: raw_global_id -> compact output row.
+  // This is O(grid_size * GROUPBY_CARDINALITY_THRESHOLD) work (~20K elements at grid=160),
+  // not O(num_rows). The shmem_aggs kernel then performs an inline lookup per row using
+  // (mapping_block_id, local_slot) to read the compact output row index from this table,
+  // which is L2-cache resident (~80KB).
   {
     auto key_transform_map = compute_key_transform_map(
       num_rows, unique_keys, stream, cudf::get_current_device_resource_ref());
@@ -147,13 +172,14 @@ std::pair<rmm::device_uvector<size_type>, bool> compute_single_pass_aggs(
   auto agg_results          = create_results_table(
     static_cast<size_type>(unique_keys.size()), values, agg_kinds, is_agg_intermediate, stream, mr);
   auto d_results_ptr = mutable_table_device_view::create(*agg_results, stream);
-  compute_shared_memory_aggs(grid_size,
+  compute_shared_memory_aggs(shmem_max_grid_size,
                              available_shmem_size,
                              num_rows,
                              row_bitmask,
                              local_mapping_indices.data(),
                              global_mapping_indices.data(),
-                             block_cardinality.data(),
+                             grid_size * GROUPBY_BLOCK_SIZE,
+                             static_cast<size_type>(unique_keys.size()),
                              *d_spass_values,
                              *d_results_ptr,
                              d_agg_kinds.data(),
