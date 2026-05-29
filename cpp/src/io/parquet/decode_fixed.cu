@@ -996,7 +996,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size_t, 8)
   constexpr bool has_strings_t =
     (static_cast<uint32_t>(kernel_mask_t) & STRINGS_MASK_NON_DELTA) != 0;
 
-  constexpr int rolling_buf_size    = decode_block_size_t * 2;
+  constexpr int rolling_buf_size    = decode_block_size_t * 4;
   constexpr int rle_run_buffer_size = rle_stream_required_run_buffer_size<decode_block_size_t>();
 
   __shared__ __align__(16) page_state_s state_g;
